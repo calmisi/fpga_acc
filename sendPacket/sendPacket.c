@@ -29,7 +29,7 @@
 #include "xpmon_be.h"
 
 #ifdef DEBUG_VERBOSE /* Enable both normal and verbose logging */
-#define log_verbose(args...)    printf(args)
+#define log_verbose(args...)    D(args)
 #else
 #define log_verbose(x...)
 #endif
@@ -47,17 +47,43 @@
 #define MAC_BUF_LEN 18 //
 #define DECLARE_MAC_BUF(var)  char var[MAC_BUF_LEN] //
 
+/*
+ * macString:	mac address like "ab:cd:ef:11:22:33"
+ * addr 	: 	an array of u_int8_t[6]
+ */
 static void macString2Array(char * macString, u_int8_t * addr){
 	sscanf(macString, MAC_FMT,addr,addr+1,addr+2,addr+3,addr+4,addr+5);
 }
 
+static void usage(void){
+	const char * cmd = "sendPacket";
+	fprintf(stderr,
+			"Usage:\n"
+			"%s arguments\n"
+			"\t-S size		batched packet size sends every time\n"
+			"\t-s size		per packet size in the batched packet\n"
+			"",
+			cmd);
+
+	exit(0);
+}
 
 //global variables
-int thread_running[MAX_THREADS];
-int thread0_exit;
-int thread1_exit;
-int thread2_exit;
-int thread3_exit;
+int thread_running[MAX_THREADS]; //0:packetReceive 1:packet send no interval 2:packetc send with interval
+int dma_channel0_exit;
+int dma_channel1_exit;
+int dma_channel2_exit;
+int dma_channel3_exit;
+
+#ifdef MEMORY_FEEDBACK
+MemorySync TxDoneSync0={0,PTHREAD_MUTEX_INITIALIZER};
+MemorySync TxDoneSync1={0,PTHREAD_MUTEX_INITIALIZER};
+MemorySync TxDoneSync2={0,PTHREAD_MUTEX_INITIALIZER};
+MemorySync TxDoneSync3={0,PTHREAD_MUTEX_INITIALIZER};
+#endif
+
+static int batchedPacketSize;
+static int perPacketSize;
 
 void * receive_data(TestCmd * test);
 void * sendPacket_once(TestCmd * test);
@@ -131,25 +157,22 @@ static void FormatBuffer1(unsigned char * buf,int bufferSize,int chunksize)
 	}
 }
 
-static void FormatBuffer2(unsigned char * buf, int bufferSize){
+static void FormatBatchedBuffer(unsigned char * buf, int batchedSize, int perSize){
 	int i;
+	int maxNo = 512;
 
-	setMacHeader(buf,
-			"aa:bb:cc:dd:ee:ff",
-			"87:87:87:87:87:87",
-			ETHERTYPE_IP);
+	for(i = 0; i < batchedSize; i++ ){
+		*(buf + i) = i % maxNo;
+	}
 
-	i = sizeof(struct ether_header);
-	for(; i < bufferSize; i++ ){
-		*(buf + i) = i;
+	for(i = 0; i< batchedSize / perSize ; i++){
+		setMacHeader(buf + i * perSize,
+					"aa:bb:cc:dd:ee:ff",
+					"87:87:87:87:87:87",
+					ETHERTYPE_IP);
 	}
 
 }
-
-
-
-
-
 
 void printMenu()
 {
@@ -220,32 +243,65 @@ int readReservedMM(){
 }
 
 int test(){
-	unsigned char * buf = (unsigned char *)malloc(100);
-	FormatBuffer2(buf,100);
-	macPacketPrint(buf,100);
-	D("gaobin shi ge sb %d",sizeof(buf));
+	unsigned char * buf = (unsigned char *)malloc(batchedPacketSize);
+	FormatBatchedBuffer(buf,batchedPacketSize, perPacketSize);
+	batchedPacketPrint(buf,batchedPacketSize,perPacketSize);
 	return 0;
 }
 
 
 int main(int argc, char ** argv){
 	int control, i, ret;
-	int psize;
+	int batchedSize = 0, perSize = 0;
 	TestCmd testCmd;
 
-	if (argc != 2)
-	{
-		printf("error!\n"
-				"this exe needs only one arguement, which indicate the packet size.\n"
-				"for example: sendPacket 230\n");
-		return -1;
-	}else{
-		psize = atoi(argv[1]);
-		if(psize < 64 || psize > 9999){
-			printf("error!\n"
-					"packet size is %d, it should between 64 and 9999\n",psize);
-			return -1;
+	int ch;
+
+	while( (ch = getopt(argc, argv,"s:S:")) != -1){
+		switch(ch) {
+		default:
+			D("bad option %c %s", ch, optarg);
+			usage();
+			break;
+		case 'S':
+			i = atoi(optarg);
+			if(i < 64 || i > 9999){
+				D("invalid argument of '-S'! batched packet size is %d, it should between 64 and 9999",i);
+				break;
+			}
+			batchedSize = i;
+			break;
+
+		case 's':
+			i = atoi(optarg);
+			if(i < 64 || i > 9999){
+				D("invalid argument of '-s'! per packet size is %d, it should between 64 and 9999",i);
+				break;
+			}
+			perSize = i;
+			break;
 		}
+	}
+
+	if(batchedSize == 0){
+		D("missing argument \"-S batchedSize\"");
+		usage();
+	}else{
+		batchedPacketSize = batchedSize;
+	}
+
+	if(perSize == 0){
+		D("missing argument \"-s per_packet_size\"");
+		usage();
+	}else{
+		if((batchedSize < perSize) || ((batchedSize % perSize) != 0)){
+			if(batchedSize < perSize)
+				D("per paket size (%d) is smaller than batched packet size (%d)!", i, batchedSize);
+			if((batchedSize % perSize) != 0)
+				D("batched packet size (%d) should be integral multiple of per pakcet size (%d)",batchedSize ,i);
+			exit(0);
+		}
+		perPacketSize = perSize;
 	}
 
 	int tmode = ENABLE_LOOPBACK;
@@ -255,9 +311,10 @@ int main(int argc, char ** argv){
 
 	testCmd.Engine = 0;
 	testCmd.TestMode = tmode;
-	testCmd.MaxPktSize = psize;
+	testCmd.MaxPktSize = batchedSize;
+	testCmd.MinPktSize = perSize;
 
-	thread0_exit = 0;		//thread 0 is not exit
+	dma_channel0_exit = 0;		//thread 0 is not exit
 	for(i = 0; i< MAX_THREADS; i++){
 		thread_running[i] = 0;
 	}
@@ -288,6 +345,7 @@ int main(int argc, char ** argv){
 					exit(-1);
 				}
 			}
+			sleep(1);
 			break;
 		}
 		case 3:
@@ -297,26 +355,53 @@ int main(int argc, char ** argv){
 				printf("ERROR; return code from pthread_create() is %d\n", ret);
 				exit(-1);
 			}
+			sleep(1);
 			break;
 		}
 		case 4:
-			readReservedMM();
+			if(testCmd.Engine == 0 ){
+				if(thread_running[1] == 0)
+					ret = xlnx_thread_create(&sendPacket, &testCmd);
+				else{
+					printf("Exiting at %d %s()\n",__LINE__,__FUNCTION__);
+					exit(-1);
+				}
+
+				if (ret){
+					printf("ERROR; return code from pthread_create() is %d\n", ret);
+					exit(-1);
+				}
+			}
+			sleep(1);
 			break;
 		case 5:
-			break;
+			if(testCmd.Engine == 0 ){
+				if(thread_running[2] == 0)
+					ret = xlnx_thread_create(&sendPacket_interval, &testCmd);
+				else{
+					printf("Exiting at %d %s()\n",__LINE__,__FUNCTION__);
+					exit(-1);
+				}
 
+				if (ret){
+					printf("ERROR; return code from pthread_create() is %d\n", ret);
+					exit(-1);
+				}
+			}
+			sleep(1);
+			break;
 		case 8:
 			test();
 			break;
 		case 9:
-			thread0_exit = 1;
+			dma_channel0_exit = 1;
 			printf("stop all the test\n");
+			sleep(2);
 			break;
 		case 0:
 		default:
 			break;
 		}
-		sleep(2);
 
 	}
 
@@ -346,7 +431,7 @@ void * receive_data(TestCmd * test){
 	FILE * fp_read;
 	fp_read = fopen("RX_read_data.txt","w+");
 	if(fp_read== NULL){
-		printf("open file tx_write_log.txt failed!\n");
+		D("open file tx_write_log.txt failed!");
 	}
 #endif
 
@@ -354,7 +439,7 @@ void * receive_data(TestCmd * test){
 	if(engine == 0){
 		readfd= open("/dev/xraw_data0",O_RDWR);
 		if(readfd < 0){
-			printf("Can't open file \n");
+			D("Can't open file \"/dev/xraw_data0\"");
 			exit(-1);
 		}
 #ifdef MEMORY_FEEDBACK
@@ -364,7 +449,7 @@ void * receive_data(TestCmd * test){
 	}else if(engine == 1){
 		readfd= open("/dev/xraw_data1",O_RDWR);
 		if(readfd < 0){
-			printf("Can't open file \n");
+			D("Can't open file \"/dev/xraw_data1\"");
 			exit(-1);
 		}
 #ifdef MEMORY_FEEDBACK
@@ -374,7 +459,7 @@ void * receive_data(TestCmd * test){
 	}else if(engine == 2){
 		readfd= open("/dev/xraw_data2",O_RDWR);
 		if(readfd < 0){
-			printf("Can't open file \n");
+			D("Can't open file \"/dev/xraw_data2\"");
 			exit(-1);
 		}
 #ifdef MEMORY_FEEDBACK
@@ -384,7 +469,7 @@ void * receive_data(TestCmd * test){
 	}else if(engine == 3){
 		readfd= open("/dev/xraw_data3",O_RDWR);
 		if(readfd < 0){
-			printf("Can't open file \n");
+			D("Can't open file \"/dev/xraw_data3\"");
 			exit(-1);
 		}
 #ifdef MEMORY_FEEDBACK
@@ -400,28 +485,28 @@ void * receive_data(TestCmd * test){
 	rxInfo.freeNum = 0;
 	ret_val=ioctl(readfd,IGET_RX_PACKETINFO, &rxInfo);
 	if(ret_val < 0){
-		printf("receive IOCTL FAILED:%d\n ",ret_val);
+		D("receive IOCTL FAILED:%d ",ret_val);
 		exit(-1);
 	}
-	printf("***<thread: receive_data>***  call ioctl(), get the RxBufs size is %d\n",rxInfo.bufferNum);
+	D("call ioctl(), get the RxBufs size is %d",rxInfo.bufferNum);
 
 #ifdef MMap
 	if(rxInfo.bufferNum > 0)
 	{
 		if((readBuffer = mmap(NULL,PAGE_SIZE * rxInfo.bufferNum, PROT_READ ,MAP_SHARED, readfd, 0)) == MAP_FAILED)
 		{
-			 printf("mmap failed.\n");
+			 D("mmap failed.");
 			 exit(-1);
 		}
-		printf("***<thread: receive_data>***  mmap(), set memory map done\n");
+		D("mmap(), set memory map done");
 	}else{
-		printf("cannot get the rxbufs number from dirver\n!");
+		D("cannot get the rxbufs number from dirver!");
 		exit(-1);
 	}
 #endif
 
 	unsigned long count = 0;
-	printf("***<thread: receive_data>***  start loop for stroing RX data\n");
+	D("start loop for stroing RX data");
 	while(1)
 	{
 		//call ioctl to know how many packet rx received
@@ -436,7 +521,7 @@ void * receive_data(TestCmd * test){
 
 		if(userInfo.expected > 0)
 		{
-			printf("***<thread: receive_data>***  return from IGET_TRN_RXUSRINFO, expected is %d\n",userInfo.expected);
+			log_verbose("return from IGET_TRN_RXUSRINFO, expected is %d",userInfo.expected);
 			//if rx get packet, then read the data
 			for(i =0; i< userInfo.expected ; i++)
 			{
@@ -447,12 +532,12 @@ void * receive_data(TestCmd * test){
 				packetSize = packetInfo.buffSize;
 
 				count++;
-				printf("receive %d packet >>> startNo:%d, endNo:%d, pageNum:%d, packetSize:%d\n",count, startNo,endNo,pageNum,packetSize);
+				log_verbose("receive %d packet >>> startNo:%d, endNo:%d, pageNum:%d, packetSize:%d",count, startNo,endNo,pageNum,packetSize);
 //				printf("receive %d packet >>> pageNum:%d, packetSize:%d\n",count, pageNum,packetSize);
 				if((count % 10000) == 0)
-					printf("have received %d packets\n",count);
+					D("have received %d packets",count);
 #ifdef DEBUG_VERBOSE
-				macPacketPrint(readBuffer + startNo * PAGE_SIZE,packetSize);
+				batchedPacketPrint(readBuffer + startNo * PAGE_SIZE, packetSize ,perPacketSize );
 #endif
 
 #ifdef WRITE_TO_FILE
@@ -470,7 +555,7 @@ void * receive_data(TestCmd * test){
 			rxInfo.freeNum = freePages;
 			ret_val=ioctl(readfd,IGET_RX_PACKETINFO, &rxInfo);
 			if(ret_val < 0){
-				printf("receive IOCTL FAILED:%d\n ",ret_val);
+				D("receive IOCTL FAILED:%d ",ret_val);
 				exit(-1);
 			}
 
@@ -482,7 +567,7 @@ void * receive_data(TestCmd * test){
 #endif
 		}
 		if(engine == 0){
-			if( (thread0_exit == 1) && (userInfo.expected ==0))
+			if( (dma_channel0_exit == 1) && (userInfo.expected ==0))
 			{
 //				printf("***<thread: receive_data>***  get stop signal,ready to stop, retry is %d\n",retry);
 				if(retry >= 15){
@@ -493,7 +578,7 @@ void * receive_data(TestCmd * test){
 				retry++;
 			}
 		}else if(engine == 1){
-			if( (thread1_exit == 1) && (userInfo.expected ==0))
+			if( (dma_channel1_exit == 1) && (userInfo.expected ==0))
 			{
 				if(retry >= 15){
 					thread_running[2] = 0;
@@ -503,7 +588,7 @@ void * receive_data(TestCmd * test){
 				retry++;
 			}
 		}else if(engine == 2){
-			if( (thread2_exit == 1) && (userInfo.expected ==0))
+			if( (dma_channel2_exit == 1) && (userInfo.expected ==0))
 			{
 				if(retry >= 15){
 					thread_running[4] = 0;
@@ -513,7 +598,7 @@ void * receive_data(TestCmd * test){
 				retry++;
 			}
 		}else if(engine == 3){
-			if( (thread3_exit == 1) && (userInfo.expected ==0))
+			if( (dma_channel3_exit == 1) && (userInfo.expected ==0))
 			{
 				if(retry >= 15){
 					thread_running[6] = 0;
@@ -526,10 +611,10 @@ void * receive_data(TestCmd * test){
 	}
 
 ERROR:
-	printf("***<thread: receive_data>*** stopped\n");
+	D("thread receive_data stopped");
 #ifdef MMap
 	if(munmap(readBuffer,PAGE_SIZE * rxInfo.bufferNum) !=0 ){
-		printf("munmap failed\n");
+		D("munmap failed");
 	}
 #endif
 
@@ -543,10 +628,11 @@ ERROR:
 void * sendPacket_once(TestCmd * test){
 	unsigned char * buffer;
 	int file_desc,ret;
-	int packetSize = test->MaxPktSize;
+	int batchedSize = test->MaxPktSize;
+	int perSize = test->MinPktSize;
 	int engine = test->Engine;
 
-	buffer = (char *) malloc(packetSize);
+	buffer = (char *) malloc(batchedSize);
 
 	if(!buffer)
 	{
@@ -562,15 +648,14 @@ void * sendPacket_once(TestCmd * test){
 			exit(-1);
 		}
 	}
-//	FormatBuffer1(buffer,packetSize,50);
-	FormatBuffer2(buffer,packetSize);
+	FormatBatchedBuffer(buffer,batchedSize, perSize);
 
 	printf("After format, packet is:\n");
-	macPacketPrint(buffer, packetSize);
+	batchedPacketPrint(buffer, batchedSize, perSize);
 
 
-	ret=write(file_desc,buffer,packetSize);
-	if(ret < packetSize)
+	ret=write(file_desc,buffer,batchedSize);
+	if(ret < batchedSize)
 	{
 		printf("write packet smaller than expected!\n");
 	}else{
@@ -583,4 +668,328 @@ void * sendPacket_once(TestCmd * test){
 	pthread_exit(NULL);
 }
 
+void * sendPacket(TestCmd * test){
+	unsigned char * buffer;
+	unsigned long bufferLen;
+	int file_desc, ret;
+	int packetSize = test->MaxPktSize;
+	int engine = test->Engine;
+	unsigned long count = 0;
 
+	MemorySync * TxDoneSync = NULL;
+	int chunksize=0;
+	int PacketSent=0;
+
+	if(engine == 0 && thread_running[2])
+	{
+		D("thread sendPacket_interval is running, cannot start 2 send packet thread!");
+		thread_running[1] = 0;
+		D("terminate sendPacket thread for engine %d",engine);
+		pthread_exit(NULL);
+	}else if(engine == 1 && thread_running[5])
+	{
+		D("thread sendPacket_interval is running, cannot start 2 send packet thread!");
+		thread_running[4] = 0;
+		D("terminate sendPacket thread for engine %d",engine);
+		pthread_exit(NULL);
+	}if(engine == 2 && thread_running[8])
+	{
+		D("thread sendPacket_interval is running, cannot start 2 send packet thread!");
+		thread_running[7] = 0;
+		D("terminate sendPacket thread for engine %d",engine);
+		pthread_exit(NULL);
+	}if(engine == 3 && thread_running[11])
+	{
+		D("thread sendPacket_interval is running, cannot start 2 send packet thread!");
+		thread_running[10] = 0;
+		D("terminate sendPacket thread for engine %d",engine);
+		pthread_exit(NULL);
+	}
+
+
+	if(packetSize % 4){
+		chunksize = packetSize + (4 - (packetSize % 4));
+	}else{
+		chunksize = packetSize;
+	}
+
+	bufferLen = BUFFER_SIZE - (BUFFER_SIZE % (chunksize * 512));
+	buffer = (char *) valloc(bufferLen);
+	if(!buffer)
+	{
+		printf("Unable to allocate memory \n");
+		exit(-1);
+	}
+
+	if(engine == 0)
+	{
+		file_desc= open("/dev/xraw_data0",O_RDWR);
+		if(file_desc < 0){
+			printf("Can't open file \n");
+			free(buffer);
+			exit(-1);
+		}
+
+		thread_running[1] = 1;
+#ifdef MEMORY_FEEDBACK
+		TxDoneSync = &TxDoneSync0;
+#endif
+	}else if(engine == 1){
+		file_desc= open("/dev/xraw_data1",O_RDWR);
+		if(file_desc < 0){
+			printf("Can't open file \n");
+			free(buffer);
+			exit(-1);
+		}
+
+		thread_running[4] = 1;
+#ifdef MEMORY_FEEDBACK
+		TxDoneSync = &TxDoneSync1;
+#endif
+	}else if(engine == 2){
+		file_desc= open("/dev/xraw_data2",O_RDWR);
+		if(file_desc < 0){
+			printf("Can't open file \n");
+			free(buffer);
+			exit(-1);
+		}
+
+		thread_running[7] = 1;
+#ifdef MEMORY_FEEDBACK
+		TxDoneSync = &TxDoneSync2;
+#endif
+	}else if(engine == 3){
+		file_desc= open("/dev/xraw_data3",O_RDWR);
+		if(file_desc < 0){
+			printf("Can't open file \n");
+			free(buffer);
+			exit(-1);
+		}
+
+		thread_running[10] = 1;
+#ifdef MEMORY_FEEDBACK
+		TxDoneSync = &TxDoneSync3;
+#endif
+	}
+
+//initialize the available memory with the total memory.
+#ifdef MEMORY_FEEDBACK
+	if (0 != initMemorySync(TxDoneSync, PAGE_SIZE * 2048))
+	{
+		perror("Bad Pointer TxDoneSync: MemorySync");
+	}
+#endif
+	FormatBuffer(buffer,bufferLen,chunksize,packetSize);
+
+	D("thread sendPacket start loop for sending packets");
+	while(1)
+	{
+#ifdef MEMORY_FEEDBACK
+		if(0 == ReserveAvailable(TxDoneSync, PAGE_SIZE))
+		{
+			if(PacketSent + chunksize <= bufferLen )
+			{
+				ret=write(file_desc,buffer+PacketSent,packetSize);
+				count ++;
+				if(ret < packetSize)
+				{
+					FreeAvailable(TxDoneSync, PAGE_SIZE);
+					//TODO
+					D("send packet no.%ld get ret is%d, smaller than expected %d!",count ,ret, packetSize);
+				}
+				else
+				{
+					PacketSent = PacketSent + chunksize;
+				}
+
+			}
+			else
+			{
+				FreeAvailable(TxDoneSync,PAGE_SIZE);
+				PacketSent = 0;
+			}
+
+		}
+#else
+		if(PacketSent + chunksize <= bufferLen )
+		{
+			ret=write(file_desc,buffer+PacketSent,packetSize);
+			count ++;
+			if(ret < packetSize)
+			{
+				D("send packet no.%ld get ret is%d, smaller than expected %d!",count ,ret, packetSize);
+			}
+			else
+			{
+				PacketSent = PacketSent + chunksize;
+			}
+
+		}
+		else
+		{
+			PacketSent = 0;
+		}
+#endif
+		if(engine == 0)
+		{
+			if(dma_channel0_exit == 1){
+				D("thread sendPacket get stop signal,ready to stop");
+				thread_running[1] = 0;
+				while(thread_running[0]);
+				goto ERROR;
+			}
+		}else if(engine == 1)
+		{
+			if(dma_channel1_exit == 1){
+				thread_running[4] = 0;
+				while(thread_running[3]);
+				goto ERROR;
+			}
+		}else if(engine == 2)
+		{
+			if(dma_channel2_exit == 1){
+				thread_running[7] = 0;
+				while(thread_running[6]);
+				goto ERROR;
+			}
+		}else if(engine == 3)
+		{
+			if(dma_channel3_exit == 1){
+				thread_running[10] = 0;
+				while(thread_running[9]);
+				goto ERROR;
+			}
+		}
+
+	}
+
+ERROR:
+	D("thread sendPacket stopped");
+	//clear works
+	close(file_desc);
+	free(buffer);
+	pthread_exit(NULL);
+
+}
+
+void * sendPacket_interval(TestCmd * test){
+	char *buffer;
+	unsigned long bufferLen;
+	int file_desc,ret;
+	int packetSize = test->MaxPktSize;
+	int engine = test->Engine;
+	unsigned long count = 0;
+
+	MemorySync * TxDoneSync = NULL;
+	int chunksize=0;
+	int PacketSent=0;
+
+	if(engine == 0 && thread_running[1])
+	{
+		D("thread sendPacket is running, cannot start 2 send packet thread!");
+		D("terminate sendPacket_interval thread for engine %d",engine);
+		thread_running[2] = 0;
+		pthread_exit(NULL);
+
+	}
+
+
+	if(packetSize % 4){
+		chunksize = packetSize + (4 - (packetSize % 4));
+	}else{
+		chunksize = packetSize;
+	}
+
+	bufferLen = BUFFER_SIZE - (BUFFER_SIZE % (chunksize * 512));
+	buffer = (char *) valloc(bufferLen);
+	if(!buffer)
+	{
+		D("Unable to allocate memory");
+		exit(-1);
+	}
+	if(engine == 0)
+	{
+		file_desc= open("/dev/xraw_data0",O_RDWR);
+		if(file_desc < 0){
+			printf("Can't open file \n");
+			free(buffer);
+			exit(-1);
+		}
+		thread_running[2] = 1;
+
+#ifdef MEMORY_FEEDBACK
+		TxDoneSync = &TxDoneSync0;
+#endif
+	}
+
+	FormatBuffer(buffer,bufferLen,chunksize,packetSize);
+
+	while(1)
+	{
+#ifdef MEMORY_FEEDBACK
+		if(0 == ReserveAvailable(TxDoneSync, PAGE_SIZE))
+		{
+			if(PacketSent + chunksize <= bufferLen )
+			{
+				ret=write(file_desc,buffer+PacketSent,packetSize);
+				count ++;
+				if(ret < packetSize)
+				{
+					FreeAvailable(TxDoneSync, PAGE_SIZE);
+					//TODO
+					D("send packet no.%ld get ret is%d, smaller than expected %d!",count ,ret, packetSize);
+				}
+				else
+				{
+					PacketSent = PacketSent + chunksize;
+				}
+				usleep(10*1000);
+			}
+			else
+			{
+				FreeAvailable(TxDoneSync,PAGE_SIZE);
+				PacketSent = 0;
+			}
+		}
+#else
+		if(PacketSent + chunksize <= bufferLen )
+		{
+			ret=write(file_desc,buffer+PacketSent,packetSize);
+			count ++;
+			if(ret < packetSize)
+			{
+				D("send packet no.%ld get ret is%d, smaller than expected %d!",count ,ret, packetSize);
+			}
+			else
+			{
+				PacketSent = PacketSent + chunksize;
+			}
+			usleep(10*1000);
+		}
+		else
+		{
+			PacketSent = 0;
+		}
+#endif
+
+
+		if(engine == 0)
+		{
+			if(dma_channel0_exit == 1){
+				D("thread sendPacket_interval get stop signal,ready to stop");
+				thread_running[2] = 0;
+				while(thread_running[0]);
+				goto ERROR;
+			}
+		}
+
+	}
+
+ERROR:
+	D("thread sendPacket_interval stopped");
+	//clear works
+	close(file_desc);
+	free(buffer);
+
+	pthread_exit(NULL);
+}

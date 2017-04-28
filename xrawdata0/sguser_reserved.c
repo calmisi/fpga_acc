@@ -247,7 +247,7 @@
 
 
 #define MINPKTSIZE      (64)
-#define NUM_BUFS        2048
+#define NUM_BUFS        100
 #define BUFALIGN        8
 #define BYTEMULTIPLE    8   /**< Lowest sub-multiple of memory path */
 
@@ -385,6 +385,7 @@ unsigned long reservedMM_size;
 
 
 int initBuf(Buffer * bufs){
+//	unsigned char * bufPages;
 	struct page * bufPages;
 	int i, offset;
 
@@ -398,9 +399,10 @@ int initBuf(Buffer * bufs){
 	if(!request_mem_region(reservedMM_start, reservedMM_size, RESERVEDMM_IO_DESP))
 				return -EBUSY;
 	reservedMM_addr = ioremap(reservedMM_start, reservedMM_size);
-	if(reservedMM_addr){
-		printk(KERN_INFO "reservedMM_addr = 0x%lx\n", (unsigned long)reservedMM_addr);
-
+	printk(KERN_INFO "reservedMM_addr = 0x%lx\n", (unsigned long)reservedMM_addr);
+	if (reservedMM_addr)
+	{
+		int i;
 		for (i = 0; i < Mem_size *1024 * 1024; i += 4)
 		{
 			reservedMM_addr[i] = 'a';
@@ -408,10 +410,6 @@ int initBuf(Buffer * bufs){
 			reservedMM_addr[i + 2] = 'c';
 			reservedMM_addr[i + 3] = 'd';
 		}
-	}else{
-		printk(KERN_INFO "ioremap reservedMM failed\n");
-		release_mem_region(reservedMM_start, reservedMM_size);
-		return -1;
 	}
 
 	//check the ioremap region if it is page-aligned
@@ -425,9 +423,10 @@ int initBuf(Buffer * bufs){
 		bufPages = pfn_to_page(reservedMM_start >> PAGE_SHIFT);
 	}
 
+
 	//init Rxbufs
 	if(bufPages == NULL){
-		printk(KERN_ERR "init RX buffs failed, cannot get reserved memory pages.\n");
+		printk(KERN_ERR "init TX buffs failed, cannot get free page.\n");
 		return -1;
 	}else{
 		bufs->TotalNum = NUM_BUFS;
@@ -444,11 +443,11 @@ int initBuf(Buffer * bufs){
 	for(i = 0; i < NUM_BUFS; i++){
 //		bufs->origVA[i] = (unsigned char *)(bufPages + BUFSIZE * i);
 		bufs->origVA[i] = (unsigned char *)(bufPages + i);
-//		printk(KERN_INFO "xrawdata0 get one free page at address bufs->origVA[i] %lx.\n",bufs->origVA[i]);
+		printk(KERN_INFO "xrawdata0 get one free page at address bufs->origVA[i] %lx.\n",bufs->origVA[i]);
 		bufs->readable[i] =0;
 	}
 
-	printk(KERN_INFO "init RX buffs success.\n");
+	printk(KERN_INFO "init TX buffs success.\n");
 	return 0;
 }
 
@@ -461,7 +460,7 @@ unsigned char * AllocBuf(Buffer * bufs){
 		bufs->headBuf = (bufs ->headBuf + 1) % NUM_BUFS;
 		bufs->headAllocPtr = (bufs->headBuf == 0) ? NUM_BUFS -1 : bufs->headBuf -1;
 
-//		printk(KERN_INFO "headAllocPtr is %d, allocate buffer at bufs->origVA[bufPtr] %lx.\n",bufs->headAllocPtr, bufs->origVA[bufPtr]);
+		printk(KERN_INFO "headAllocPtr is %d, allocate buffer at bufs->origVA[bufPtr] %lx.\n",bufs->headAllocPtr, bufs->origVA[bufPtr]);
 		return bufs->origVA[bufPtr];
 	}else{
 		return NULL;
@@ -587,7 +586,7 @@ myPutRxPkt (void *hndl, PktBuf * vaddr, int numpkts, unsigned int privdata)
 
 		bufNo = (pbuf->bufInfo - (unsigned char *)RxBufs.basePage)/sizeof(struct page);
 
-//		printk("myPutRxPkt put buf, bufNo is %d, packet at page %p.\n",bufNo, pbuf->bufInfo);
+		printk("myPutRxPkt put buf, bufNo is %d, packet at page %p, at address %p.\n",bufNo, pbuf->bufInfo, page_address(pbuf->bufInfo));
 		RxBufs.tailAllocPtr = (bufNo +1) % NUM_BUFS;
 
 		RxBufs.headReadPtr = bufNo;
@@ -623,16 +622,16 @@ myPutRxPkt (void *hndl, PktBuf * vaddr, int numpkts, unsigned int privdata)
 			usrAddr = NULL;
 		}
 
-//		unsigned char * bufferAddress = page_address(pbuf->bufInfo);
-//		int h;
-//		printk("<0>");
-//		for(h = 0; h < pbuf->size; h++)
-//		{
-//			printk("%02X ", bufferAddress[h]);
-//			if ((h+1)% 50 == 0)
-//				printk("\n");
-//		}
-//		printk("\n");
+		unsigned char * bufferAddress = page_address(pbuf->bufInfo);
+		int h;
+		printk("<0>");
+		for(h = 0; h < pbuf->size; h++)
+		{
+			printk("%02X ", bufferAddress[h]);
+			if ((h+1)% 50 == 0)
+				printk("\n");
+		}
+		printk("\n");
 
 		vaddr++;
 	}
@@ -690,7 +689,7 @@ myGetRxPkt (void *hndl, PktBuf * vaddr, unsigned int size, int numpkts,
 			break;
 		}
 
-//		printk(KERN_INFO "myGetRxPkt get one buffer at address %lx.\n",bufVA);
+		printk(KERN_INFO "myGetRxPkt get one buffer at address %lx.\n",bufVA);
 
 		pbuf->pktBuf = bufVA;
 		pbuf->bufInfo = bufVA;

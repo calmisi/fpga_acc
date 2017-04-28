@@ -71,6 +71,44 @@ void macPacketPrint(const unsigned char * buf, const int num)
 
 }
 
+void batchedPacketPrint(const unsigned char * buf, const int totalSize, const int perSize)
+{
+	int i, j, base;
+
+	if(totalSize % perSize){
+		printf("totalSize should be integral multiple of perSize\n");
+		return;
+	}
+	for(j = 0; j< totalSize/perSize; j++){
+		base = j * perSize;
+		//print mac header 14 bytes
+		for(i = base; i < 14 + base; i++){
+			printf("%02X ", buf[i]);
+			if ( (i - base +1)% 6 == 0 ){
+				printf("   ""   ");
+				printf("   ");
+			}
+		}
+		printf("\n");
+
+		//print the rest
+		for(;i < base + perSize; i++){
+			printf("%02X ", buf[i]);
+			if ( ((i - base -14 + 1)% 8 == 0) && ((i - base - 14 + 1)% prChunkSize != 0))
+					printf("   ");
+
+			if ((i - base +1-14)% prChunkSize == 0)
+				printf("\n");
+		}
+		printf("\n\n");
+	}
+	for(i =0; i <prChunkSize + prChunkSize/8 - 1; i++)
+		printf("===");
+	printf("\n");
+	return;
+
+}
+
 void hexPrint(const unsigned char *buf, const int num)
 {
     int i;

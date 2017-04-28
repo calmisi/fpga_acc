@@ -36,6 +36,7 @@ int xlnx_thread_create(void *fp(void *),void *data);
 void hexPrint(const unsigned char *buf, const int num);
 void fhexPrint(const FILE * file, const unsigned char * buf, const int num);
 void macPacketPrint(const unsigned char * buf, const int num);
+void batchedPacketPrint(const unsigned char * buf, const int totalSize, const int perSize);
 
 
 

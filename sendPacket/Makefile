@@ -1,6 +1,8 @@
 OBJS = sendPacket.c tools.o xpmon_be.h calm_debug.h
 
-CFLAGS = -DMMap -DDEBUG_VERBOSE
+CFLAGS = -DMMap 
+#CFLAGS += -DDEBUG_VERBOSE
+CFLAGS += -DMEMORY_FEEDBACK
 CFLAGS += -D_DEBUG
 LFLAGS = -lpthread
 
